@@ -101,7 +101,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     w[i, j, c_out_tile, c_in_tile] = nisa.nc_transpose(weight_copy[i, j, c_out_tile, c_in_tile])
 
     # Define the number of output rows to process at a time
-    # Start with a smaller number that's divisible by 2. Adjust as needed.
+    # Start with a small number divisible by 2. If small images fail, consider adjusting this number.
     out_chunk = 2
     n_chunks = (out_height + out_chunk - 1) // out_chunk
 
@@ -112,43 +112,31 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             chunk_end = min((c + 1) * out_chunk, out_height)
             this_chunk_height = chunk_end - chunk_start
 
-            # Determine how many input rows we need
-            # Filter extends beyond the output rows, so we add filter_height - 1
+            # Compute how many input rows we need
             in_rows = this_chunk_height + filter_height - 1
 
-            # Ensure shape elements are integers
-            in_rows_int = int(in_rows)
-            input_w = int(input_width)
-            # Load only the required input rows
+            # Ensure we do not exceed input_height
+            if chunk_start + in_rows > input_height:
+                in_rows = input_height - chunk_start
+
+            # All involved variables are Python integers, so we can directly use them
             x = nl.ndarray(
-                    shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), in_rows_int, input_w),
+                    shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), in_rows, input_width),
                     dtype=X.dtype, 
                     buffer=nl.sbuf,
             )
-            # Here we ensure we do not go out of input bounds
-            # input_load_start = chunk_start
-            # input_load_end = chunk_start + in_rows_int - 1
             input_load_start = chunk_start
-            input_load_end = chunk_start + in_rows_int - 1
+            input_load_end = input_load_start + in_rows - 1
             if input_load_end >= input_height:
-                # For smaller images, ensure we don't go out of range
                 input_load_end = input_height - 1
-                # Adjust in_rows_int if we had to shrink
-                in_rows_int = input_load_end - input_load_start + 1
-                x = nl.ndarray(
-                        shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), in_rows_int, input_w),
-                        dtype=X.dtype, 
-                        buffer=nl.sbuf,
-                )
 
+            # Load only the required input rows
             for tile_in in nl.affine_range(n_tiles_c_in):
                 x[tile_in] = nl.load(
                         X[b, tile_in * c_in_pmax : (tile_in + 1) * c_in_pmax, input_load_start : input_load_end + 1, :]
                 )
 
             # Load bias tile
-            # We must incorporate bias addition as per instructions
-            # Because bias is per output channel, we load it once per c_out_tile chunk
             for tile_out in nl.affine_range(n_tiles_c_out):
                 output_sbuf = nl.ndarray(
                         (nl.par_dim(c_out_pmax), out_chunk, out_width),
@@ -163,16 +151,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 bias_tile = nl.load(bias[tile_out*c_out_pmax : (tile_out+1)*c_out_pmax])
 
                 for out_row in nl.affine_range(this_chunk_height):
-                    # out_row must not exceed the in_rows_int - filter_height + 1 range
-                    # but by construction it doesn't
                     result = nl.zeros((128, out_width), dtype=nl.float32, buffer=nl.psum)
-
+                    # Perform convolution
                     for i in nl.affine_range(filter_height):
-                        # Ensure we don't go out of loaded input rows
-                        if out_row + i >= in_rows_int:
+                        if out_row + i >= in_rows:
                             break
                         for j in nl.affine_range(filter_width):
-                            # Ensure indexing doesn't exceed
                             if j + out_width > input_width:
                                 break
                             for tile_in in nl.affine_range(n_tiles_c_in):
@@ -181,13 +165,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                                         x[tile_in, :, out_row + i, j : j + out_width],
                                         transpose_x=True
                                 )
-                    # Add bias to the result
+
+                    # Add bias
                     result = nisa.tensor_scalar(result, np.add, bias_tile)
 
                     output_sbuf[:, out_row, :] = nl.copy(result)
 
-                # Store the result for this chunk of output rows
-                # Handle if it's the last chunk with fewer rows
                 nl.store(
                         X_out[b, tile_out * c_out_pmax : (tile_out + 1) * c_out_pmax, chunk_start : chunk_start + this_chunk_height, :],
                         value=output_sbuf[:, 0:this_chunk_height, :],
