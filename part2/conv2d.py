@@ -67,12 +67,76 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
+    c_out_pmax = c_in_pmax # max output 
+    n_tiles_c_out = out_channels // c_out_pmax
+
+    # prepare weights
+    W = W.reshape((n_tiles_c_out, c_out_pmax, n_tiles_c_in, c_in_pmax, filter_height, filter_width))
+    weight_sbuf = nl.ndarray(
+            (n_tiles_c_out, nl.par_dim(c_out_pmax), n_tiles_c_in, c_in_pmax, filter_height, filter_width), 
+            dtype=W.dtype,
+            buffer=nl.sbuf
+        )
+    weight_copy = nl.ndarray(
+            (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_out_pmax), c_in_pmax), 
+            dtype=W.dtype, 
+            buffer=nl.sbuf
+        )
+    w = nl.ndarray(
+            (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_in_pmax), c_out_pmax),
+            dtype=W.dtype,
+            buffer=nl.sbuf
+        )
+
+    for c_out_tile in nl.affine_range(n_tiles_c_out):
+        weight_sbuf[c_out_tile] = nl.load(W[c_out_tile])
+
+    for c_out_tile in nl.affine_range(n_tiles_c_out):
+        for c_in_tile in nl.affine_range(n_tiles_c_in):
+            for i in nl.affine_range(filter_height):
+                for j in nl.affine_range(filter_width):
+                    weight_copy[i, j, c_out_tile, c_in_tile, :, :] = nl.copy(
+                            weight_sbuf[c_out_tile, :, c_in_tile, :, i, j], dtype=W.dtype
+                        )
+                    w[i, j, c_out_tile, c_in_tile] = nisa.nc_transpose(weight_copy[i, j, c_out_tile, c_in_tile])
+
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+        # TODO: Perform the convolution of X[b] with the weights W and bias b, followed by a maxpool
+        # and store the result in X_out[b]
+        x = nl.ndarray(
+                    shape=(n_tiles_c_in,nl.par_dim(c_in_pmax), input_height, input_width),
+                    dtype=X.dtype, 
+                    buffer=nl.sbuf,
+            )
+        for tile_in in nl.affine_range(n_tiles_c_in):
+            x[tile_in] = nl.load(
+                    X[b, tile_in * c_in_pmax : (tile_in + 1) * c_in_pmax]
+            )
+        
+        for tile_out in nl.affine_range(n_tiles_c_out):
+            output_sbuf = nl.ndarray(
+                    (nl.par_dim(c_out_pmax), out_height, out_width),
+                    dtype=X.dtype,
+                    buffer=nl.sbuf
+                )
 
+            for out_row in nl.affine_range(out_height):
+                result = nl.zeros((128, out_width), dtype=nl.float32, buffer=nl.psum)
+
+                for i in nl.affine_range(filter_height):
+                    for j in nl.affine_range(filter_width):
+                        for tile_in in nl.affine_range(n_tiles_c_in):
+                            result += nl.matmul(
+                                    w[i, j, tile_out, tile_in],
+                                    x[tile_in, :, out_row + i, j : j + out_width],
+                                    transpose_x=True
+                            )
+
+                output_sbuf[:, out_row, :] = nl.copy(result)
+            nl.store(
+                    X_out[b, tile_out * c_out_pmax : (tile_out + 1) * c_out_pmax, :, :],
+                    value=output_sbuf,
+                )
     return X_out
-
