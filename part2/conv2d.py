@@ -101,7 +101,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     w[i, j, c_out_tile, c_in_tile] = nisa.nc_transpose(weight_copy[i, j, c_out_tile, c_in_tile])
 
     # Define the number of output rows to process at a time
-    out_chunk = 50  # Example value, should fit in SBUF and be divisible by 2 as guidance
+    out_chunk = 50  # Example value, should be divisible by 2 and fit in SBUF
     n_chunks = (out_height + out_chunk - 1) // out_chunk
 
     for b in nl.affine_range(batch_size):
@@ -115,8 +115,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             input_load_start = chunk_start
             input_load_end = chunk_end + filter_height - 1
 
+            # Cast computed shape elements to int explicitly to avoid type issues
+            input_load_h = int(input_load_end - input_load_start + 1)
+            input_w = int(input_width)
+
             x = nl.ndarray(
-                        shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), input_load_end - input_load_start + 1, input_width),
+                        shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), input_load_h, input_w),
                         dtype=X.dtype, 
                         buffer=nl.sbuf,
                 )
@@ -138,7 +142,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     for i in nl.affine_range(filter_height):
                         for j in nl.affine_range(filter_width):
                             for tile_in in nl.affine_range(n_tiles_c_in):
-                                # Indexing inside x is relative to input_load_start
                                 result += nl.matmul(
                                         w[i, j, tile_out, tile_in],
                                         x[tile_in, :, out_row + i, j : j + out_width],
@@ -147,7 +150,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                     output_sbuf[:, out_row, :] = nl.copy(result)
 
-                # Store only the relevant chunk of output
                 nl.store(
                         X_out[b, tile_out * c_out_pmax : (tile_out + 1) * c_out_pmax, chunk_start : chunk_start + this_chunk_height, :],
                         value=output_sbuf[:, 0:this_chunk_height, :],
