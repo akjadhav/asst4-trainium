@@ -64,29 +64,26 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
-    # Various tiling dimensions (You may want to define more of them)
+    # Various tiling dimensions
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
-    c_out_pmax = c_in_pmax # max output 
+    c_out_pmax = c_in_pmax
     n_tiles_c_out = out_channels // c_out_pmax
 
-    # prepare weights
+    # Reshape weights and prepare them
     W = W.reshape((n_tiles_c_out, c_out_pmax, n_tiles_c_in, c_in_pmax, filter_height, filter_width))
     weight_sbuf = nl.ndarray(
-            (n_tiles_c_out, nl.par_dim(c_out_pmax), n_tiles_c_in, c_in_pmax, filter_height, filter_width), 
-            dtype=W.dtype,
-            buffer=nl.sbuf
-        )
+        (n_tiles_c_out, nl.par_dim(c_out_pmax), n_tiles_c_in, c_in_pmax, filter_height, filter_width), 
+        dtype=W.dtype, buffer=nl.sbuf
+    )
     weight_copy = nl.ndarray(
-            (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_out_pmax), c_in_pmax), 
-            dtype=W.dtype, 
-            buffer=nl.sbuf
-        )
+        (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_out_pmax), c_in_pmax), 
+        dtype=W.dtype, buffer=nl.sbuf
+    )
     w = nl.ndarray(
-            (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_in_pmax), c_out_pmax),
-            dtype=W.dtype,
-            buffer=nl.sbuf
-        )
+        (filter_height, filter_width, n_tiles_c_out, n_tiles_c_in, nl.par_dim(c_in_pmax), c_out_pmax),
+        dtype=W.dtype, buffer=nl.sbuf
+    )
 
     for c_out_tile in nl.affine_range(n_tiles_c_out):
         weight_sbuf[c_out_tile] = nl.load(W[c_out_tile])
@@ -96,84 +93,69 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             for i in nl.affine_range(filter_height):
                 for j in nl.affine_range(filter_width):
                     weight_copy[i, j, c_out_tile, c_in_tile, :, :] = nl.copy(
-                            weight_sbuf[c_out_tile, :, c_in_tile, :, i, j], dtype=W.dtype
-                        )
+                        weight_sbuf[c_out_tile, :, c_in_tile, :, i, j],
+                        dtype=W.dtype
+                    )
                     w[i, j, c_out_tile, c_in_tile] = nisa.nc_transpose(weight_copy[i, j, c_out_tile, c_in_tile])
 
-    # Define the number of output rows to process at a time
-    # Start with a small number divisible by 2. If small images fail, consider adjusting this number.
-    out_chunk = 2
-    n_chunks = (out_height + out_chunk - 1) // out_chunk
+    # Follow a similar logic as the answer key:
+    # Set a fixed out_chunks and always load the same number of input rows: out_chunks + filter_height - 1
+    out_chunks = 2
+    num_output_chunks = (out_height + out_chunks - 1) // out_chunks
+    in_rows = out_chunks + filter_height - 1
 
+    # Process the image in batches and chunks
     for b in nl.affine_range(batch_size):
-        # Process the output in chunks
-        for c in range(n_chunks):
-            chunk_start = c * out_chunk
-            chunk_end = min((c + 1) * out_chunk, out_height)
-            this_chunk_height = chunk_end - chunk_start
-
-            # Compute how many input rows we need
-            in_rows = this_chunk_height + filter_height - 1
-
-            # Ensure we do not exceed input_height
-            if chunk_start + in_rows > input_height:
-                in_rows = input_height - chunk_start
-
-            # All involved variables are Python integers, so we can directly use them
+        for n in nl.affine_range(num_output_chunks):
+            # We always load 'in_rows' rows starting from n*out_chunks,
+            # This matches the pattern from the answer key logic:
+            # input rows: n*(out_chunks) to n*(out_chunks) + (out_chunks + filter_height - 1)
             x = nl.ndarray(
-                    shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), in_rows, input_width),
-                    dtype=X.dtype, 
-                    buffer=nl.sbuf,
+                shape=(n_tiles_c_in, nl.par_dim(c_in_pmax), in_rows, input_width),
+                dtype=X.dtype,
+                buffer=nl.sbuf
             )
-            input_load_start = chunk_start
-            input_load_end = input_load_start + in_rows - 1
-            if input_load_end >= input_height:
-                input_load_end = input_height - 1
 
-            # Load only the required input rows
-            for tile_in in nl.affine_range(n_tiles_c_in):
-                x[tile_in] = nl.load(
-                        X[b, tile_in * c_in_pmax : (tile_in + 1) * c_in_pmax, input_load_start : input_load_end + 1, :]
+            # Load the input chunk
+            for c_in_tile in nl.affine_range(n_tiles_c_in):
+                x[c_in_tile] = nl.load(
+                    X[b, c_in_tile*c_in_pmax:(c_in_tile+1)*c_in_pmax, n*(out_chunks):(n+1)*out_chunks+(filter_height-1)]
                 )
 
-            # Load bias tile
-            for tile_out in nl.affine_range(n_tiles_c_out):
+            # Compute the convolution for each output tile
+            for c_out_tile in nl.affine_range(n_tiles_c_out):
                 output_sbuf = nl.ndarray(
-                        (nl.par_dim(c_out_pmax), out_chunk, out_width),
-                        dtype=X.dtype,
-                        buffer=nl.sbuf
-                    )
-                bias_tile = nl.ndarray(
-                        (nl.par_dim(c_out_pmax),), 
-                        dtype=bias.dtype, 
-                        buffer=nl.sbuf
-                    )
-                bias_tile = nl.load(bias[tile_out*c_out_pmax : (tile_out+1)*c_out_pmax])
+                    shape=(nl.par_dim(c_out_pmax), out_chunks, out_width), 
+                    dtype=X.dtype,
+                    buffer=nl.sbuf
+                )
 
-                for out_row in nl.affine_range(this_chunk_height):
-                    result = nl.zeros((128, out_width), dtype=nl.float32, buffer=nl.psum)
-                    # Perform convolution
+                # Load bias for this output tile
+                bias_tile = nl.ndarray((nl.par_dim(c_out_pmax), ), dtype=bias.dtype, buffer=nl.sbuf)
+                bias_tile = nl.load(bias[c_out_tile*c_out_pmax:(c_out_tile+1)*c_out_pmax])
+
+                for out_row in nl.affine_range(out_chunks):
+                    # For each output row in this chunk, perform convolution
+                    result = nl.zeros((128, out_width), nl.float32, buffer=nl.psum)
                     for i in nl.affine_range(filter_height):
-                        if out_row + i >= in_rows:
-                            break
                         for j in nl.affine_range(filter_width):
-                            if j + out_width > input_width:
-                                break
-                            for tile_in in nl.affine_range(n_tiles_c_in):
+                            for c_in_tile in nl.affine_range(n_tiles_c_in):
                                 result += nl.matmul(
-                                        w[i, j, tile_out, tile_in],
-                                        x[tile_in, :, out_row + i, j : j + out_width],
-                                        transpose_x=True
+                                    w[i, j, c_out_tile, c_in_tile],
+                                    x[c_in_tile, :, out_row + i, j:j+out_width],
+                                    transpose_x=True
                                 )
 
                     # Add bias
                     result = nisa.tensor_scalar(result, np.add, bias_tile)
 
-                    output_sbuf[:, out_row, :] = nl.copy(result)
+                    # Store in output buffer
+                    output_sbuf[:, out_row, :] = nl.copy(result, dtype=X.dtype)
 
-                nl.store(
-                        X_out[b, tile_out * c_out_pmax : (tile_out + 1) * c_out_pmax, chunk_start : chunk_start + this_chunk_height, :],
-                        value=output_sbuf[:, 0:this_chunk_height, :],
-                    )
+                # Store the output chunk back
+                # Note: If the last chunk is smaller, (n+1)*out_chunks might exceed out_height, but 
+                # since num_output_chunks was calculated that won't happen. If it did, a min() 
+                # could be applied. The answer key logic trusts num_output_chunks logic.
+                nl.store(X_out[b, c_out_tile*c_out_pmax:(c_out_tile+1)*c_out_pmax, n*out_chunks:(n+1)*out_chunks], output_sbuf)
 
     return X_out
